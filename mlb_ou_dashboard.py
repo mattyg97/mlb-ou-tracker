@@ -1,88 +1,127 @@
 import streamlit as st
 import requests
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime
 
-# --------------------------
-# Get past MLB games by team matchup
-# --------------------------
+st.set_page_config(page_title="MLB O/U Tracker", layout="wide")
+st.title("⚾ MLB Head-to-Head Over/Under Tracker (2025)")
 
-@st.cache_data(ttl=1800)
-def get_head_to_head_results(team1, team2, season=2024, max_games=10):
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&season={season}&team={team1_id}&opponent={team2_id}&gameType=R"
+# -----------------------------
+# Get All MLB Teams (Dynamic)
+# -----------------------------
+@st.cache_data(ttl=86400)
+def get_teams():
+    url = "https://statsapi.mlb.com/api/v1/teams?sportId=1"
     res = requests.get(url).json()
+    teams = {
+        team["name"]: team["id"]
+        for team in res["teams"] if team["sport"]["id"] == 1
+    }
+    return teams
 
+# -----------------------------
+# Get Matchup Results (2025)
+# -----------------------------
+@st.cache_data(ttl=1800)
+def get_matchups(team1_id, team2_id, ou_line=8.5, max_games=15):
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&season=2025&teamId={team1_id}&opponentId={team2_id}&gameType=R"
+    res = requests.get(url).json()
     games = res.get('dates', [])
     results = []
 
-    for game_day in games:
-        game = game_day['games'][0]
+    for g in games:
+        game = g['games'][0]
         if game['status']['abstractGameState'] != "Final":
             continue
+
         game_id = game['gamePk']
-        game_data = requests.get(f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live").json()
+        details = requests.get(f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live").json()
 
         try:
-            home = game_data['gameData']['teams']['home']['name']
-            away = game_data['gameData']['teams']['away']['name']
-            home_score = game_data['liveData']['linescore']['teams']['home']['runs']
-            away_score = game_data['liveData']['linescore']['teams']['away']['runs']
-            total_runs = home_score + away_score
-            game_date = game_data['gameData']['datetime']['originalDate']
-        except KeyError:
+            home = details['gameData']['teams']['home']['name']
+            away = details['gameData']['teams']['away']['name']
+            h_score = details['liveData']['linescore']['teams']['home']['runs']
+            a_score = details['liveData']['linescore']['teams']['away']['runs']
+            total = h_score + a_score
+            date = details['gameData']['datetime']['originalDate']
+            ou_result = "Over" if total > ou_line else "Under"
+        except:
             continue
 
-        # Use a default O/U line for now (can be updated with bookmaker API)
-        ou_line = 8.5
-        ou_result = "Over" if total_runs > ou_line else "Under"
-
         results.append({
-            'Date': game_date,
-            'Home': home,
-            'Away': away,
-            'Score': f"{away_score}–{home_score}",
-            'Total Runs': total_runs,
-            'O/U Line': ou_line,
-            'O/U Result': ou_result
+            "Date": date,
+            "Home": home,
+            "Away": away,
+            "Final Score": f"{a_score}-{h_score}",
+            "Total Runs": total,
+            "O/U Line": ou_line,
+            "O/U Result": ou_result
         })
 
         if len(results) >= max_games:
             break
 
-    return results
+    return pd.DataFrame(results)
 
-# --------------------------
-# UI
-# --------------------------
+# -----------------------------
+# Heatmap Generator
+# -----------------------------
+@st.cache_data(ttl=1800)
+def generate_heatmap_df(teams, ou_line=8.5):
+    records = []
+    for team1_name, team1_id in teams.items():
+        for team2_name, team2_id in teams.items():
+            if team1_name == team2_name:
+                continue
+            df = get_matchups(team1_id, team2_id, ou_line=ou_line, max_games=10)
+            if not df.empty:
+                pct_over = (df['O/U Result'] == "Over").mean()
+                records.append([team1_name, team2_name, round(pct_over, 2)])
 
-st.set_page_config(page_title="MLB Head-to-Head O/U Tracker", layout="wide")
-st.title("⚾ MLB Over/Under Tracker – Head-to-Head Matchups")
+    return pd.DataFrame(records, columns=["Team 1", "Team 2", "% Over"])
 
-team_name_to_id = {
-    "Yankees": 147, "Red Sox": 111, "Dodgers": 119, "Giants": 137,
-    "Mets": 121, "Braves": 144, "Phillies": 143, "Cubs": 112,
-    "Padres": 135, "Astros": 117, "Rays": 139, "Orioles": 110,
-    # Add more teams as needed
-}
+# -----------------------------
+# User Interface
+# -----------------------------
+teams = get_teams()
+team_names = sorted(teams.keys())
+col1, col2 = st.columns(2)
+with col1:
+    selected_team_1 = st.selectbox("Select Team 1", team_names)
+with col2:
+    selected_team_2 = st.selectbox("Select Team 2", team_names)
 
-team_list = list(team_name_to_id.keys())
-team1 = st.selectbox("Team 1", team_list, index=0)
-team2 = st.selectbox("Team 2", team_list, index=1)
+ou_line = st.slider("Set Over/Under Line", min_value=5.0, max_value=12.0, value=8.5, step=0.5)
 
-if team1 == team2:
-    st.warning("Please select two different teams.")
+if selected_team_1 == selected_team_2:
+    st.warning("Select two different teams.")
 else:
-    team1_id = team_name_to_id[team1]
-    team2_id = team_name_to_id[team2]
+    df_results = get_matchups(
+        teams[selected_team_1],
+        teams[selected_team_2],
+        ou_line=ou_line,
+        max_games=15
+    )
 
-    data = get_head_to_head_results(team1, team2)
-    if not data:
-        st.warning("No recent matchups found between these teams.")
+    if df_results.empty:
+        st.error("No completed matchups found for 2025.")
     else:
-        df = pd.DataFrame(data)
-        st.subheader(f"Last {len(df)} Matchups: {team1} vs {team2}")
-        st.dataframe(df, use_container_width=True)
+        st.subheader(f"{selected_team_1} vs {selected_team_2} - Last {len(df_results)} Matchups")
+        st.dataframe(df_results, use_container_width=True)
 
-        over_count = (df["O/U Result"] == "Over").sum()
-        pct = (over_count / len(df)) * 100
-        st.markdown(f"📊 **{pct:.1f}%** of the last {len(df)} games went **Over 8.5** runs.")
+        pct = (df_results["O/U Result"] == "Over").mean() * 100
+        st.markdown(f"📈 **{pct:.1f}%** of these games went Over {ou_line} runs.")
+
+# -----------------------------
+# Heatmap Display
+# -----------------------------
+st.header("🔥 League-Wide Over % Heatmap (Last 10 Matchups per Pair)")
+if st.button("Generate Heatmap (Takes ~30s)"):
+    heat_df = generate_heatmap_df(teams, ou_line=ou_line)
+    pivot = heat_df.pivot(index="Team 1", columns="Team 2", values="% Over")
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    sns.heatmap(pivot, annot=True, fmt=".0%", cmap="coolwarm", ax=ax, linewidths=0.5)
+    st.pyplot(fig)
