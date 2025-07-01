@@ -2,136 +2,126 @@ import streamlit as st
 import requests
 import pandas as pd
 import matplotlib.pyplot as plt
+import seaborn as sns
 from datetime import datetime
-import time
 
-st.set_page_config(page_title="MLB O/U Tracker v2", layout="wide")
-st.title("⚾ MLB Over/Under Tracker (2025) with Live Odds & Trends")
+st.set_page_config(page_title="MLB O/U Tracker", layout="wide")
+st.title("⚾ MLB Head-to-Head Over/Under Tracker (2025)")
 
-# -------------------------
-# Setup
-# -------------------------
-ODDS_API_KEY = st.secrets.get("odds_api_key") or "YOUR_API_KEY_HERE"
-SPORT = "baseball_mlb"
-REGION = "us"
-MARKET = "totals"
-SEASON = 2025
-
+# -----------------------------
+# Get All MLB Teams (Dynamic)
+# -----------------------------
 @st.cache_data(ttl=86400)
 def get_teams():
-    res = requests.get("https://statsapi.mlb.com/api/v1/teams?sportId=1").json()
-    return {team["name"]: team["id"] for team in res["teams"] if team["sport"]["id"] == 1}
-
-# -------------------------
-# Live Odds API
-# -------------------------
-def get_live_ou_line(team1, team2):
-    if not ODDS_API_KEY or "YOUR_API_KEY_HERE" in ODDS_API_KEY:
-        return None
-
-    url = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
-    params = {
-        "regions": REGION,
-        "markets": MARKET,
-        "oddsFormat": "decimal",
-        "apiKey": ODDS_API_KEY
-    }
-
-    res = requests.get(url, params=params)
-    if res.status_code != 200:
-        return None
-
-    games = res.json()
-    for game in games:
-        if team1.lower() in game["home_team"].lower() and team2.lower() in game["away_team"].lower():
-            for bookmaker in game["bookmakers"]:
-                for market in bookmaker["markets"]:
-                    if market["key"] == "totals":
-                        outcomes = market["outcomes"]
-                        if outcomes:
-                            return {
-                                "line": outcomes[0]["point"],
-                                "over_odds": outcomes[0]["odds"],
-                                "under_odds": outcomes[1]["odds"]
-                            }
-    return None
-
-# -------------------------
-# Get Team's Last 10 Games
-# -------------------------
-@st.cache_data(ttl=1800)
-def get_team_trend(team_id, ou_line=8.5):
-    url = f"https://statsapi.mlb.com/api/v1/schedule?teamId={team_id}&sportId=1&season={SEASON}&gameType=R"
+    url = "https://statsapi.mlb.com/api/v1/teams?sportId=1"
     res = requests.get(url).json()
-    games = res.get("dates", [])
+    teams = {
+        team["name"]: team["id"]
+        for team in res["teams"] if team["sport"]["id"] == 1
+    }
+    return teams
+
+# -----------------------------
+# Get Matchup Results (2025)
+# -----------------------------
+@st.cache_data(ttl=1800)
+def get_matchups(team1_id, team2_id, ou_line=8.5, max_games=15):
+    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&season=2025&teamId={team1_id}&opponentId={team2_id}&gameType=R"
+    res = requests.get(url).json()
+    games = res.get('dates', [])
     results = []
 
     for g in games:
+        game = g['games'][0]
+        if game['status']['abstractGameState'] != "Final":
+            continue
+
+        game_id = game['gamePk']
+        details = requests.get(f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live").json()
+
         try:
-            game = g["games"][0]
-            if game["status"]["abstractGameState"] != "Final":
-                continue
-
-            game_id = game["gamePk"]
-            details = requests.get(f"https://statsapi.mlb.com/api/v1.1/game/{game_id}/feed/live").json()
-            h = details['gameData']['teams']['home']
-            a = details['gameData']['teams']['away']
-            hs = details['liveData']['linescore']['teams']['home']['runs']
-            as_ = details['liveData']['linescore']['teams']['away']['runs']
+            home = details['gameData']['teams']['home']['name']
+            away = details['gameData']['teams']['away']['name']
+            h_score = details['liveData']['linescore']['teams']['home']['runs']
+            a_score = details['liveData']['linescore']['teams']['away']['runs']
+            total = h_score + a_score
             date = details['gameData']['datetime']['originalDate']
-            total = hs + as_
-            result = "Over" if total > ou_line else "Under"
-
-            results.append({
-                "Date": date,
-                "Opponent": a["name"] if h["id"] == team_id else h["name"],
-                "Total Runs": total,
-                "O/U Result": result
-            })
-
-            if len(results) >= 10:
-                break
+            ou_result = "Over" if total > ou_line else "Under"
         except:
             continue
 
+        results.append({
+            "Date": date,
+            "Home": home,
+            "Away": away,
+            "Final Score": f"{a_score}-{h_score}",
+            "Total Runs": total,
+            "O/U Line": ou_line,
+            "O/U Result": ou_result
+        })
+
+        if len(results) >= max_games:
+            break
+
     return pd.DataFrame(results)
 
-# -------------------------
-# UI
-# -------------------------
+# -----------------------------
+# Heatmap Generator
+# -----------------------------
+@st.cache_data(ttl=1800)
+def generate_heatmap_df(teams, ou_line=8.5):
+    records = []
+    for team1_name, team1_id in teams.items():
+        for team2_name, team2_id in teams.items():
+            if team1_name == team2_name:
+                continue
+            df = get_matchups(team1_id, team2_id, ou_line=ou_line, max_games=10)
+            if not df.empty:
+                pct_over = (df['O/U Result'] == "Over").mean()
+                records.append([team1_name, team2_name, round(pct_over, 2)])
+
+    return pd.DataFrame(records, columns=["Team 1", "Team 2", "% Over"])
+
+# -----------------------------
+# User Interface
+# -----------------------------
 teams = get_teams()
 team_names = sorted(teams.keys())
 col1, col2 = st.columns(2)
 with col1:
-    team1 = st.selectbox("Team 1", team_names, index=0)
+    selected_team_1 = st.selectbox("Select Team 1", team_names)
 with col2:
-    team2 = st.selectbox("Team 2", team_names, index=1)
+    selected_team_2 = st.selectbox("Select Team 2", team_names)
 
-st.divider()
-st.subheader("🔍 Live Over/Under Line")
+ou_line = st.slider("Set Over/Under Line", min_value=5.0, max_value=12.0, value=8.5, step=0.5)
 
-live_odds = get_live_ou_line(team1, team2)
-if live_odds:
-    st.markdown(f"**O/U Line:** {live_odds['line']}  |  **Over Odds:** {live_odds['over_odds']}  |  **Under Odds:** {live_odds['under_odds']}")
-    ou_line = live_odds['line']
+if selected_team_1 == selected_team_2:
+    st.warning("Select two different teams.")
 else:
-    ou_line = st.slider("No live line found — set custom O/U line:", 5.0, 12.0, 8.5, 0.5)
+    df_results = get_matchups(
+        teams[selected_team_1],
+        teams[selected_team_2],
+        ou_line=ou_line,
+        max_games=15
+    )
 
-# -------------------------
-# Team Trend Plot
-# -------------------------
-st.subheader(f"📈 {team1} O/U Trend (Last 10 Games)")
-df_trend = get_team_trend(teams[team1], ou_line)
-if not df_trend.empty:
-    fig, ax = plt.subplots()
-    ax.plot(df_trend["Date"], df_trend["Total Runs"], marker='o')
-    for i, row in df_trend.iterrows():
-        color = "green" if row["O/U Result"] == "Over" else "red"
-        ax.text(i, row["Total Runs"] + 0.2, row["O/U Result"], color=color, ha="center", fontsize=9)
-    ax.axhline(ou_line, color="gray", linestyle="--", label="O/U Line")
-    ax.set_ylabel("Total Runs")
-    ax.set_title(f"{team1} Last 10 Games")
-    ax.legend()
+    if df_results.empty:
+        st.error("No completed matchups found for 2025.")
+    else:
+        st.subheader(f"{selected_team_1} vs {selected_team_2} - Last {len(df_results)} Matchups")
+        st.dataframe(df_results, use_container_width=True)
+
+        pct = (df_results["O/U Result"] == "Over").mean() * 100
+        st.markdown(f"📈 **{pct:.1f}%** of these games went Over {ou_line} runs.")
+
+# -----------------------------
+# Heatmap Display
+# -----------------------------
+st.header("🔥 League-Wide Over % Heatmap (Last 10 Matchups per Pair)")
+if st.button("Generate Heatmap (Takes ~30s)"):
+    heat_df = generate_heatmap_df(teams, ou_line=ou_line)
+    pivot = heat_df.pivot(index="Team 1", columns="Team 2", values="% Over")
+
+    fig, ax = plt.subplots(figsize=(14, 10))
+    sns.heatmap(pivot, annot=True, fmt=".0%", cmap="coolwarm", ax=ax, linewidths=0.5)
     st.pyplot(fig)
-else:
-    st.info("No recent games found for this team.")
